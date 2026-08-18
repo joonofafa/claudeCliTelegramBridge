@@ -35,6 +35,11 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+# httpx 는 INFO 에서 요청 URL 을 통째로 남긴다 — 텔레그램 API 는 URL 경로에 봇 토큰이 들어가므로
+# 그대로 두면 로그 파일에 토큰이 평문으로 쌓인다. 경고 이상만 남긴다.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 sessions = {}
@@ -73,7 +78,9 @@ class ClaudeSession:
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            # stderr를 PIPE로 열고 아무도 안 읽으면 파이프가 차는 순간 claude가
+            # write에서 영구 블록된다(= stdout도 멈춤 → reaper가 살아있는 턴을 죽임).
+            stderr=asyncio.subprocess.DEVNULL,
             # stream-json은 이벤트 1개 = 1줄(NDJSON). 큰 파일 Read / 대용량 Bash
             # 출력이 통째로 한 줄에 담기면 readline()이 버퍼 한계를 넘어
             # "Separator is not found, and chunk exceed the limit"로 터진다.
@@ -117,7 +124,8 @@ class ClaudeSession:
             return result
 
     def is_idle(self):
-        return self.proc is not None and \
+        # 턴이 진행 중(_lock 점유)이면 무출력이 길어도 idle이 아니다.
+        return self.proc is not None and not self._lock.locked() and \
             (asyncio.get_event_loop().time() - self.last_activity) > IDLE_TIMEOUT
 
     async def close(self):
@@ -386,33 +394,55 @@ def get_session_list(limit=10):
     files = sorted(glob.glob(f"{SESSION_DIR}/*.jsonl"), key=os.path.getmtime, reverse=True)
     files = [f for f in files if os.path.getsize(f) > 5000]
     result = []
-    for f in files[:limit]:
+    for f in files:
+        if len(result) >= limit:  # 자르기는 필터 뒤에. 앞에서 자르면 잡세션이 칸을 먹는다.
+            break
         sid = os.path.basename(f).replace(".jsonl", "")
         mtime = os.path.getmtime(f)
         from datetime import datetime as dt
         date = dt.fromtimestamp(mtime).strftime("%m/%d %H:%M")
-        first_msg = ""
+        title = ""      # CLI가 붙여둔 ai-title. 있으면 첫 메시지보다 훨씬 정확하다.
+        first_msg = ""  # 폴백: 첫 '진짜' user 메시지
+        turns = 0       # '진짜' user 턴 수. 1턴짜리 일회성 세션은 목록에서 뺀다.
         try:
             with open(f) as fp:
-                for line in fp:
+                for i, line in enumerate(fp):
+                    if i > 200:  # ai-title은 파일 앞부분에만 기록된다
+                        break
                     try:
                         d = json.loads(line)
-                        if d.get("type") == "user" and d.get("message", {}).get("role") == "user":
-                            content = d["message"].get("content", "")
-                            if isinstance(content, str):
-                                first_msg = content[:50]
-                            elif isinstance(content, list):
-                                for c in content:
-                                    if isinstance(c, dict) and c.get("type") == "text":
-                                        first_msg = c["text"][:50]
-                                        break
-                            break
                     except json.JSONDecodeError:
                         continue
+                    if d.get("type") == "ai-title" and d.get("aiTitle"):
+                        title = d["aiTitle"][:50]
+                        if turns >= 2:
+                            break
+                        continue
+                    if d.get("type") == "user" \
+                            and d.get("message", {}).get("role") == "user":
+                        content = d["message"].get("content", "")
+                        text = ""
+                        if isinstance(content, str):
+                            text = content
+                        elif isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    text = c["text"]
+                                    break
+                        text = " ".join(text.split())
+                        # 시스템 블록(<...>)과 compaction 이어받기 문구는 제목으로 쓸모없다
+                        if text and not text.startswith("<") \
+                                and not text.startswith("This session is being continued"):
+                            turns += 1
+                            if not first_msg:
+                                first_msg = text[:50]
+                            if title and turns >= 2:
+                                break
         except Exception:
             pass
-        if first_msg and not first_msg.startswith("<") and os.path.getsize(f) > 5000:
-            result.append({"idx": len(result)+1, "sid": sid, "date": date, "msg": first_msg})
+        msg = title or first_msg
+        if msg and turns >= 2:
+            result.append({"idx": len(result)+1, "sid": sid, "date": date, "msg": msg})
     return result
 
 
