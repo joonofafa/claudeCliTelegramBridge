@@ -12,6 +12,7 @@ import time
 import urllib.parse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
                           filters, ContextTypes)
 
@@ -319,6 +320,74 @@ async def extract_and_send_images(chat_id, text, bot):
     return cleaned_text
 
 
+# 텔레그램 전송 실패 두 종류:
+#  - RetryAfter(429): 서버가 대기 시간을 준다 → 그만큼 자고 재시도.
+#  - Peer_flood: 이 상대와의 상호작용이 일시 차단됐다(retry_after 없음). 같은 계정에 봇 여러 개가
+#    붙어 있으면 계정 기준으로 합산돼 걸리므로, 이 봇만 얌전해도 발생한다. 몇십 초 뒤 대체로 풀린다.
+# 끝까지 실패하면 답변을 버리지 말고 파일로 남긴다(몇 분 걸려 만든 답이 사라지는 게 제일 아깝다).
+SEND_RETRY_DELAYS = (20, 45, 90)
+SEND_CHUNK = 3500
+
+
+def _is_flood(err: Exception) -> bool:
+    return "flood" in str(err).lower()
+
+
+async def _send_one(bot, chat_id, text, parse_mode=None):
+    last = None
+    for attempt, delay in enumerate((0,) + SEND_RETRY_DELAYS):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+            return
+        except RetryAfter as exc:
+            last = exc
+            await asyncio.sleep(getattr(exc, "retry_after", 5) + 1)
+        except Exception as exc:
+            last = exc
+            if not _is_flood(exc):
+                raise
+            logger.warning("send blocked (%s); retry %d/%d", exc, attempt + 1, len(SEND_RETRY_DELAYS))
+    raise last if last else RuntimeError("send failed")
+
+
+def _chunks(text, size=SEND_CHUNK):
+    """되도록 줄 경계에서 자른다 — 문장/링크가 토막나면 스팸 필터를 더 자극한다."""
+    out, buf = [], ""
+    for line in text.split("\n"):
+        while len(line) > size:
+            if buf:
+                out.append(buf)
+                buf = ""
+            out.append(line[:size])
+            line = line[size:]
+        if len(buf) + len(line) + 1 > size:
+            out.append(buf)
+            buf = line
+        else:
+            buf = f"{buf}\n{line}" if buf else line
+    if buf:
+        out.append(buf)
+    return out or [text]
+
+
+def _stash(chat_id, text, subdir):
+    try:
+        from datetime import datetime as dt
+        import os as _os
+        d = _os.path.join(_os.path.expanduser("~"), subdir, "undelivered")
+        _os.makedirs(d, exist_ok=True)
+        path = _os.path.join(d, f"{chat_id}-{dt.now().strftime('%Y%m%d-%H%M%S')}.md")
+        with open(path, "w") as f:
+            f.write(text)
+        logger.error("undelivered reply saved: %s (%d chars)", path, len(text))
+        return path
+    except Exception as exc:
+        logger.error("failed to stash undelivered reply: %s", exc)
+        return None
+
+
 async def send_md(chat_id, text, bot):
     """Send with MarkdownV2, fallback to plain text on failure"""
     try:
@@ -326,20 +395,24 @@ async def send_md(chat_id, text, bot):
     except Exception as e:
         logger.error(f"Failed to extract/send images: {e}")
 
-    try:
-        md_text = md_to_tg(text)
-        if len(md_text) > 4000:
-            for i in range(0, len(md_text), 4000):
-                await bot.send_message(chat_id=chat_id, text=md_text[i:i+4000], parse_mode=ParseMode.MARKDOWN_V2)
-        else:
-            await bot.send_message(chat_id=chat_id, text=md_text, parse_mode=ParseMode.MARKDOWN_V2)
-    except Exception as e:
-        logger.warning(f"MarkdownV2 failed: {e}, falling back to plain text")
-        if len(text) > 4000:
-            for i in range(0, len(text), 4000):
-                await bot.send_message(chat_id=chat_id, text=text[i:i+4000])
-        else:
-            await bot.send_message(chat_id=chat_id, text=text)
+    for parse_mode, body in ((ParseMode.MARKDOWN_V2, md_to_tg(text)), (None, text)):
+        try:
+            for part in _chunks(body):
+                await _send_one(bot, chat_id, part, parse_mode)
+            return
+        except Exception as exc:
+            if parse_mode is not None:
+                logger.warning("MarkdownV2 failed: %s, falling back to plain text", exc)
+            else:
+                path = _stash(chat_id, text, ".claude-bridge")
+                logger.error("plain text send failed too: %s", exc)
+                if path:
+                    try:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=f"답변을 보내지 못했습니다({exc}). 서버에 저장했습니다:\n{path}")
+                    except Exception:
+                        pass
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -350,6 +423,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/sessions - List sessions\n"
         "/resume <number> - Resume session\n"
+        "/delete <number> - Delete session\n"
         "/reset - Reset session\n\n"
         "Send any message to chat with Claude."
     )
@@ -446,24 +520,33 @@ def get_session_list(limit=10):
     return result
 
 
-async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
+def render_sessions_view(user_id):
+    """세션 목록 텍스트+인라인 키보드를 만들고 cached_session_list를 갱신한다."""
     sess_list = get_session_list()
-    cached_session_list[update.effective_user.id] = sess_list
+    cached_session_list[user_id] = sess_list
     if not sess_list:
-        await update.message.reply_text("No saved sessions.")
-        return
+        return "No saved sessions.", None
     lines = ["Recent sessions:\n"]
     for s in sess_list:
         lines.append(f"{s['idx']}. [{s['date']}] {s['msg']}")
-    lines.append("\nTap a session below to resume it.")
-    # 각 세션을 탭-투-resume 인라인 버튼으로. callback_data는 64바이트 제한이라 idx만 싣는다.
-    keyboard = [[InlineKeyboardButton(f"{s['idx']}. [{s['date']}] {s['msg'][:30]}",
-                                      callback_data=f"resume:{s['idx']}")]
-                for s in sess_list]
-    await update.message.reply_text("\n".join(lines),
-                                    reply_markup=InlineKeyboardMarkup(keyboard))
+    lines.append("\nTap Resume to continue a session, or Delete to remove it.")
+    # 각 세션을 탭-투-resume/delete 인라인 버튼으로. callback_data는 64바이트 제한이라 idx만 싣는다.
+    keyboard = [
+        [
+            InlineKeyboardButton(f"{s['idx']}. [{s['date']}] {s['msg'][:30]}",
+                                 callback_data=f"resume:{s['idx']}"),
+            InlineKeyboardButton("Delete", callback_data=f"delete:{s['idx']}"),
+        ]
+        for s in sess_list
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        return
+    text, markup = render_sessions_view(update.effective_user.id)
+    await update.message.reply_text(text, reply_markup=markup)
 
 
 def _resume_by_idx(user_id, idx):
@@ -477,6 +560,32 @@ def _resume_by_idx(user_id, idx):
     sessions[user_id] = selected["sid"]
     return True, (f"Session restored: [{selected['date']}] {selected['msg']}\n\n"
                   "Messages will now continue in this session.")
+
+
+async def _delete_by_idx(user_id, idx):
+    """캐시된 목록에서 idx(1-based) 세션의 .jsonl 파일을 삭제. (성공여부, 메시지) 반환.
+    claude는 recent_sessions가 없어 목록이 디스크에서 생성되므로 파일 자체를 지운다."""
+    sess_list = cached_session_list.get(user_id)
+    if not sess_list:
+        return False, "Run /sessions first."
+    if idx < 1 or idx > len(sess_list):
+        return False, f"Enter a number between 1 and {len(sess_list)}."
+    selected = sess_list[idx-1]
+    sid = selected["sid"]
+    # 가드: 반드시 SESSION_DIR 바로 아래의 해당 세션 파일만 삭제
+    path = os.path.join(SESSION_DIR, f"{sid}.jsonl")
+    if os.path.dirname(os.path.realpath(path)) != os.path.realpath(SESSION_DIR) \
+            or not os.path.isfile(path):
+        return False, "Session file not found."
+    try:
+        os.remove(path)
+    except Exception as e:
+        return False, f"Failed to delete session: {e}"
+    # 현재 활성 세션이면 sessions에서 제거하고 라이브 프로세스도 리셋
+    if sessions.get(user_id) == sid:
+        sessions.pop(user_id, None)
+        await claude_sessions.reset(user_id)
+    return True, f"Deleted session: [{selected['date']}] {selected['msg']}"
 
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -496,6 +605,23 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /delete <number>\nUse /sessions to see the list.")
+        return
+    try:
+        idx = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Please enter a number.")
+        return
+    _, msg = await _delete_by_idx(user_id, idx)
+    await update.message.reply_text(msg)
+
+
 async def on_resume_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sessions 인라인 버튼(resume:<idx>) 탭 처리."""
     query = update.callback_query
@@ -509,6 +635,29 @@ async def on_resume_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ok, msg = _resume_by_idx(query.from_user.id, idx)
     await query.message.reply_text(msg)
+
+
+async def on_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sessions 인라인 버튼(delete:<idx>) 탭 처리 — 삭제 후 목록을 갱신한다."""
+    query = update.callback_query
+    if not is_authorized(query.from_user.id):
+        await query.answer("Not authorized.")
+        return
+    await query.answer()
+    try:
+        idx = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        return
+    user_id = query.from_user.id
+    ok, msg = await _delete_by_idx(user_id, idx)
+    if not ok:
+        await query.message.reply_text(msg)
+        return
+    text, markup = render_sessions_view(user_id)
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except Exception:
+        await query.message.reply_text(msg)
 
 
 async def process_claude_message(chat_id, user_id, message, bot, cleanup_paths=None):
@@ -743,6 +892,7 @@ def main():
             BotCommand("start", "Show help"),
             BotCommand("sessions", "List recent sessions"),
             BotCommand("resume", "Resume a session by number"),
+            BotCommand("delete", "Delete a session by number"),
             BotCommand("reset", "Start a new session"),
         ])
 
@@ -752,7 +902,9 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CallbackQueryHandler(on_resume_button, pattern=r"^resume:"))
+    app.add_handler(CallbackQueryHandler(on_delete_button, pattern=r"^delete:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -767,6 +919,7 @@ def main():
             "Available commands:\n"
             "/sessions - List sessions\n"
             "/resume <number> - Resume session\n"
+            "/delete <number> - Delete session\n"
             "/reset - Reset session"
         )
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
